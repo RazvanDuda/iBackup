@@ -1,6 +1,6 @@
 [package]
 name = "ibackup"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Back up an iPhone over USB to a Windows or macOS PC: full device backup, readable media/app files, and iCloud sync folders."
 license = "MIT"

@@ -1949,6 +1949,11 @@ fn work_area(ctx: &egui::Context) -> Option<egui::Rect> {
 ///
 /// `libX11` is loaded at runtime so that builds without the X11 backend keep
 /// working; every failure path simply returns `None`.
+///
+/// Only Linux has an X server to ask, so the whole Xlib block below is compiled
+/// out elsewhere: `dlopen`/`dlsym` do not exist on Windows, and referring to
+/// them there fails the link (other hosts fall back to the viewport size).
+#[cfg(target_os = "linux")]
 fn x11_work_area() -> Option<(f32, f32, f32, f32)> {
     use std::ffi::{c_char, c_int, c_long, c_ulong, c_void, CStr};
 
@@ -2051,6 +2056,13 @@ fn x11_work_area() -> Option<(f32, f32, f32, f32)> {
         close(display);
         area
     }
+}
+
+/// Every non-Linux host: there is no X11 root window to read, so the caller
+/// uses the size the compositor reports through the viewport instead.
+#[cfg(not(target_os = "linux"))]
+fn x11_work_area() -> Option<(f32, f32, f32, f32)> {
+    None
 }
 
 fn default_out_dir() -> String {

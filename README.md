@@ -66,14 +66,14 @@ them as one release with checksums:
 Push a tag to publish a release (or run the workflow by hand with a tag):
 
 ```
-git tag v0.3.0 && git push origin v0.3.0
+git tag v0.3.1 && git push origin v0.3.1
 ```
 
 To package one locally, build for that target and hand it to the same script the CI uses:
 
 ```
 cargo build --release --target x86_64-unknown-linux-gnu
-./scripts/package-release.sh linux-amd64 x86_64-unknown-linux-gnu 0.3.0
+./scripts/package-release.sh linux-amd64 x86_64-unknown-linux-gnu 0.3.1
 ```
 
 The app icon lives in `assets/` and ships with the binary everywhere:

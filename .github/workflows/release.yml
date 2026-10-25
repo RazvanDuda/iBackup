@@ -6,7 +6,7 @@ name: release
 #   macOS    Intel  (x86_64-apple-darwin)
 #   macOS    arm64  (aarch64-apple-darwin, Apple Silicon)
 #
-# Trigger: push a tag like `v0.3.0`, or run this workflow by hand with the tag
+# Trigger: push a tag like `v0.3.1`, or run this workflow by hand with the tag
 # to publish. Assets are the zips/tarballs from scripts/package-release.sh plus
 # SHA256SUMS.txt.
 
@@ -16,9 +16,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to publish (e.g. v0.3.0). Created if it does not exist."
+        description: "Tag to publish (e.g. v0.3.1). Created if it does not exist."
         required: true
-        default: "v0.3.0"
+        default: "v0.3.1"
 
 permissions:
   contents: write
