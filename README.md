@@ -49,8 +49,32 @@ cargo build --release
 
 On Fedora, first `sudo dnf install gcc` (SQLite is compiled in); Rust from rustup.rs or
 `sudo dnf install rust cargo` both work. On Windows, the MSVC toolchain (Visual Studio Build Tools, "Desktop development with C++") is
-needed because SQLite is compiled in. The included GitHub Actions workflow builds Windows and
-macOS (Intel + Apple Silicon) binaries if you push the repo to GitHub.
+needed because SQLite is compiled in.
+
+### Prebuilt binaries (GitHub Releases)
+
+`.github/workflows/release.yml` builds every release on GitHub-hosted runners and publishes
+them as one release with checksums:
+
+| Asset | Platform |
+|---|---|
+| `ibackup-<version>-windows-amd64.zip` | Windows 10/11 x64 (`x86_64-pc-windows-msvc`) |
+| `ibackup-<version>-linux-amd64.tar.gz` | Linux x64 (`x86_64-unknown-linux-gnu`, built on Ubuntu 22.04) |
+| `ibackup-<version>-macos-intel.zip` | macOS on Intel (`x86_64-apple-darwin`) |
+| `ibackup-<version>-macos-arm64.zip` | macOS on Apple Silicon (`aarch64-apple-darwin`) |
+
+Push a tag to publish a release (or run the workflow by hand with a tag):
+
+```
+git tag v0.3.0 && git push origin v0.3.0
+```
+
+To package one locally, build for that target and hand it to the same script the CI uses:
+
+```
+cargo build --release --target x86_64-unknown-linux-gnu
+./scripts/package-release.sh linux-amd64 x86_64-unknown-linux-gnu 0.3.0
+```
 
 The app icon lives in `assets/` and ships with the binary everywhere:
 

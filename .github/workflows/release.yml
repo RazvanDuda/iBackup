@@ -1,0 +1,114 @@
+name: release
+
+# Builds the four shipping binaries and publishes them as one GitHub Release.
+#   Windows  amd64  (x86_64-pc-windows-msvc)
+#   Linux    amd64  (x86_64-unknown-linux-gnu, glibc 2.35 / Ubuntu 22.04)
+#   macOS    Intel  (x86_64-apple-darwin)
+#   macOS    arm64  (aarch64-apple-darwin, Apple Silicon)
+#
+# Trigger: push a tag like `v0.3.0`, or run this workflow by hand with the tag
+# to publish. Assets are the zips/tarballs from scripts/package-release.sh plus
+# SHA256SUMS.txt.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.3.0). Created if it does not exist."
+        required: true
+        default: "v0.3.0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-amd64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            label: linux-amd64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            label: macos-intel
+          - os: macos-15
+            target: aarch64-apple-darwin
+            label: macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version from Cargo.toml
+        id: ver
+        shell: bash
+        run: echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: ./scripts/package-release.sh "${{ matrix.label }}" "${{ matrix.target }}" "${{ steps.ver.outputs.version }}"
+
+      - name: Collect archives
+        shell: bash
+        run: |
+          mkdir -p out
+          cp dist/*.zip dist/*.tar.gz out/ 2>/dev/null || true
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: artifacts
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ibackup ${{ inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: artifacts/*
