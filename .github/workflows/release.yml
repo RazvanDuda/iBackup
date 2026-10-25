@@ -8,7 +8,8 @@ name: release
 #
 # Trigger: push a tag like `v0.3.1`, or run this workflow by hand with the tag
 # to publish. Assets are the zips/tarballs from scripts/package-release.sh plus
-# SHA256SUMS.txt.
+# SHA256SUMS.txt. (GitHub always also offers auto-generated "Source code"
+# archives on the release page; those are not the app.)
 
 on:
   push:
@@ -33,6 +34,8 @@ env:
 jobs:
   build:
     name: ${{ matrix.label }}
+    # Deleting a tag also fires a `push` event; do not build for removals.
+    if: ${{ github.event_name != 'push' || github.event.deleted == false }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
