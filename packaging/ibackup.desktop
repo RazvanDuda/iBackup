@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=0.3.0
+Name=ibackup
+GenericName=iPhone backup
+Comment=Back up an iPhone over USB: device backup, photos, app files and iCloud
+Exec=ibackup ui
+Icon=ibackup
+Terminal=false
+Categories=Utility;Archiving;FileTools;
+Keywords=iphone;backup;photos;itunes;finder;

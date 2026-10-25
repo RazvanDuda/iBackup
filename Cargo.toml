@@ -1,0 +1,76 @@
+[package]
+name = "ibackup"
+version = "0.3.0"
+edition = "2021"
+description = "Back up an iPhone over USB to a Windows or macOS PC: full device backup, readable media/app files, and iCloud sync folders."
+license = "MIT"
+
+[[bin]]
+name = "ibackup"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned exactly: idevice makes breaking changes on every 0.1.x release.
+# `ring` instead of the default `aws-lc` so Windows builds don't need CMake/NASM.
+idevice = { version = "=0.1.68", default-features = false, features = [
+    "ring",
+    "usbmuxd",
+    "pair",
+    "afc",
+    "mobilebackup2",
+    "house_arrest",
+    "installation_proxy",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "process", "time"] }
+plist = "1.8"
+clap = { version = "4.5", features = ["derive", "env"] }
+anyhow = "1"
+indicatif = "0.17"
+chrono = "0.4"
+filetime = "0.2"
+fs2 = "0.4"
+uuid = { version = "1", features = ["v4"] }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+futures = "0.3"
+gethostname = "0.5"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+hex = "0.4"
+
+# Desktop GUI (`ibackup ui`); pure Rust so the same binary builds on Windows, macOS and Linux.
+# Linux folder picker uses the XDG desktop portal (no GTK dev packages needed to build).
+eframe = { version = "=0.29.1", optional = true }
+rfd = { version = "0.16", optional = true }
+# Image decoding: the runtime window/taskbar icon (assets/ibackup-256.png) plus
+# the previews in `ibackup browse` (JPEG, PNG, GIF, BMP, WebP, TIFF, ICO).
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "bmp",
+    "webp",
+    "tiff",
+    "ico",
+], optional = true }
+# HEIC/HEIF previews (the default iPhone camera format).
+zune-heic = { version = "0.5", optional = true }
+
+[features]
+default = ["gui"]
+# `cargo build --no-default-features` for a CLI-only binary (headless servers, CI).
+gui = ["dep:eframe", "dep:rfd", "dep:image", "dep:zune-heic"]
+
+# Embeds assets/ibackup.ico into ibackup.exe (Explorer + taskbar icon on Windows).
+# No-op on every other host: build.rs simply compiles nothing on non-Windows hosts.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
