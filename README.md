@@ -201,6 +201,10 @@ against a hash the iPhone computes from its own original. A mismatch is re-copie
 again. Results go to `verified.json` (path, size, hash, method), and the summary tells you
 which camera-roll dates are fully verified, e.g. "all 4,212 camera-roll files are verified".
 
+Verifying is incremental: a file already recorded in `verified.json` whose size and date still
+match on the phone and on this computer is not hashed again, so a second `--verify` only looks
+at what changed or was never proven.
+
 ### Deleting verified photos from the iPhone (v0.3)
 
 ```
@@ -230,6 +234,20 @@ names and similar library data for the photos that stay. Without it, delete in t
 instead: Library → All Photos → Select, drag across the verified range, Delete, then empty
 Recently Deleted.
 
+### Emptying the phone: `--delete-all`
+
+```
+ibackup media --out ~/iPhoneBackups/media --delete-all --rebuild-photos-db
+```
+
+For when the phone cannot hash its own files (see *No resources available* below) or you are
+offloading everything anyway. Same groups, same log, but the proof comes from this computer
+instead of the phone: a group is deleted only if every one of its files is here with the size
+and date the phone reports, and still hashes to what `verified.json` recorded for it. Anything
+else stays on the iPhone and is listed at the end. The verification pass is skipped entirely.
+The confirmation is a different phrase (`delete all N`) so it cannot be typed by reflex, and
+`--delete-before` still applies.
+
 ## Getting a truly complete backup
 
 1. **Turn on backup encryption once:** `ibackup encryption enable`. Without it, Apple leaves
@@ -245,6 +263,22 @@ Recently Deleted.
 4. **Full iCloud Photos library without "Download and Keep Originals":** install
    [icloudpd](https://github.com/icloud-photos-downloader/icloud_photos_downloader)
    and add `--icloudpd you@example.com`. It signs in to Apple itself (including 2FA).
+
+## "afc error: No resources available"
+
+AFC status 3: the iPhone's own file service (`afcd`) ran out of file handles or memory. It is
+not about the file being asked for — every request after it fails the same way, and the state
+survives reconnecting, unplugging and restarting `ibackup`. The phone has to be restarted.
+
+`ibackup` treats it as a device-level failure, not a per-file one: it reconnects and retries,
+and if it persists it stops with that advice instead of printing thousands of identical errors.
+It also never reports a folder it could not read as "0 files on device". Since 0.3.2 the file
+handles it opens on the phone are always closed, even after a read error — leaking them is what
+exhausts `afcd` in the first place.
+
+If it happens mid-run: unlock the phone, unplug and replug the cable, restart the iPhone, then
+run the same command again. Copies already made are kept and skipped, and verification resumes
+from `verified.json`, so nothing is redone.
 
 ## When the phone refuses files (MBErrorDomain/104)
 

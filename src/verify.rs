@@ -98,15 +98,36 @@ pub(crate) fn hash_local(path: &Path, algo: Algo) -> std::io::Result<Vec<u8>> {
 pub(crate) async fn hash_device_reread(afc: &mut AfcClient, path: &str) -> Result<Vec<u8>, IdeviceError> {
     let mut fd = afc.open(path.to_string(), AfcFopenMode::RdOnly).await?;
     let mut h = Sha256::new();
+    let mut read_err = None;
     loop {
-        let chunk = fd.read_n(4 * 1024 * 1024).await?;
-        if chunk.is_empty() {
-            break;
+        match fd.read_n(4 * 1024 * 1024).await {
+            Ok(chunk) if chunk.is_empty() => break,
+            Ok(chunk) => h.update(&chunk),
+            Err(e) => {
+                read_err = Some(e);
+                break;
+            }
         }
-        h.update(&chunk);
     }
-    fd.close().await?;
+    // Always release the handle on the phone, even after a failed read: a leaked handle is one the
+    // AFC service can never reuse, and once it runs out every request fails with "No resources
+    // available" (AFC error 3) until the iPhone is restarted.
+    let closed = fd.close().await;
+    if let Some(e) = read_err {
+        return Err(e);
+    }
+    closed?;
     Ok(h.finalize().to_vec())
+}
+
+/// Already proven earlier (verified.json) and unchanged on both sides since?
+/// The record only counts while the size and date on the phone still match, and the local copy is
+/// still the file we hashed. Re-checking 16 GB of photos on every run is what makes a repeated
+/// `--verify` both slow and hard on the phone's file service.
+fn already_verified(m: &Manifest, f: &RemoteFile, local: &Path) -> bool {
+    m.get(&f.path)
+        .is_some_and(|v| v.size == f.size && (v.mtime - f.mtime).abs() <= 2)
+        && afc_copy::unchanged(local, f)
 }
 
 enum Outcome {
@@ -166,6 +187,8 @@ async fn check_one(afc: &mut AfcClient, f: &RemoteFile, local: &Path) -> Result<
 pub struct VerifyReport {
     pub verified: Vec<String>,
     pub failed: Vec<String>,
+    /// Files not hashed again because verified.json already covers them unchanged.
+    pub reused: usize,
 }
 
 /// Verify every file in `files` (already copied under `out`). A mismatching file is
@@ -177,7 +200,7 @@ pub async fn run(
     stats: &mut Stats,
 ) -> Result<VerifyReport> {
     let mut manifest = load_manifest(out);
-    let mut report = VerifyReport { verified: Vec::new(), failed: Vec::new() };
+    let mut report = VerifyReport { verified: Vec::new(), failed: Vec::new(), reused: 0 };
     let bar = bytes_bar(files.iter().map(|f| f.size).sum(), "verify");
 
     let mut i = 0usize;
@@ -188,6 +211,14 @@ pub async fn run(
         while i < files.len() {
             let f = &files[i];
             let local = local_path_for(out, &f.path);
+
+            if already_verified(&manifest, f, &local) {
+                report.verified.push(f.path.clone());
+                report.reused += 1;
+                bar.inc(f.size);
+                i += 1;
+                continue;
+            }
             bar.set_message(f.path.clone());
 
             let mut outcome = check_one(&mut afc, f, &local).await;
@@ -223,7 +254,7 @@ pub async fn run(
                     stats.errors.push(format!("verify {}: {e}", f.path));
                 }
                 Err(e) if attempt < MAX_ATTEMPTS => {
-                    bar.println(format!("  connection lost while verifying ({e}); resuming…"));
+                    bar.println(format!("  device stopped answering while verifying ({}); resuming…", afc_copy::explain(&e)));
                     let _ = save_manifest(out, &manifest);
                     afc_copy::retry_pause().await;
                     continue 'outer; // reconnect, retry this same file
@@ -231,7 +262,7 @@ pub async fn run(
                 Err(e) => {
                     bar.finish_and_clear();
                     save_manifest(out, &manifest)?;
-                    bail!("verification failed repeatedly: {e}");
+                    bail!("verification failed repeatedly: {}", afc_copy::explain(&e));
                 }
             }
             bar.inc(f.size);
@@ -282,6 +313,40 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         assert_eq!(Algo::from_len(20), Some(Algo::Sha1));
+    }
+
+    #[test]
+    fn verified_manifest_entry_is_reused_only_while_unchanged() {
+        let dir = std::env::temp_dir().join("ibackup-verify-reuse-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let local = dir.join("IMG_0001.HEIC");
+        std::fs::write(&local, b"abc").unwrap();
+        let f = RemoteFile { path: "DCIM/100APPLE/IMG_0001.HEIC".into(), size: 3, mtime: 1_700_000_000 };
+        let mut m = Manifest::new();
+        m.insert(
+            f.path.clone(),
+            Verified {
+                size: 3,
+                mtime: 1_700_000_000,
+                algo: Algo::Sha1,
+                hash: "00".into(),
+                method: "device-hash".into(),
+                verified_at: String::new(),
+            },
+        );
+        filetime::set_file_mtime(&local, filetime::FileTime::from_unix_time(f.mtime, 0)).unwrap();
+        assert!(already_verified(&m, &f, &local));
+
+        // Changed on the phone: must be checked again.
+        let bigger = RemoteFile { size: 4, ..f.clone() };
+        assert!(!already_verified(&m, &bigger, &local));
+        let newer = RemoteFile { mtime: f.mtime + 60, ..f.clone() };
+        assert!(!already_verified(&m, &newer, &local));
+        // Local copy replaced by a different file of the same size: mtime no longer matches.
+        std::fs::write(&local, b"abcd").unwrap();
+        assert!(!already_verified(&m, &f, &local));
+        // Never verified at all.
+        assert!(!already_verified(&Manifest::new(), &f, &local));
     }
 
     #[test]

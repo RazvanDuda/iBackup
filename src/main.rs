@@ -16,7 +16,7 @@ mod ui;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value as Json};
 
@@ -140,27 +140,42 @@ struct MediaFlags {
     /// Turn iCloud Photos off first. Implies --verify.
     #[arg(long)]
     delete_verified: bool,
+    /// Delete EVERY camera-roll photo/video that has a copy on this computer, verified or not
+    /// (asks to confirm). Use when the iPhone itself cannot hash its files. Turn iCloud Photos
+    /// off first. Implies --delete-verified but skips the verification pass.
+    #[arg(long)]
+    delete_all: bool,
     /// With --delete-verified: only delete items dated before this day (YYYY-MM-DD)
-    #[arg(long, value_name = "DATE", requires = "delete_verified")]
+    #[arg(long, value_name = "DATE")]
     delete_before: Option<String>,
     /// With --delete-verified: also reset the Photos database so the iPhone rebuilds it
     /// (fixes blank thumbnails; loses albums/favorites). Restart the iPhone afterwards.
-    #[arg(long, requires = "delete_verified")]
+    #[arg(long)]
     rebuild_photos_db: bool,
     /// Skip the typed confirmation for --delete-verified
-    #[arg(long, requires = "delete_verified")]
+    #[arg(long)]
     yes: bool,
 }
 
 impl MediaFlags {
     fn prune(&self) -> Result<Option<prune::Options>> {
-        if !self.delete_verified {
+        if !self.delete_verified && !self.delete_all {
+            for (set, flag) in [
+                (self.delete_before.is_some(), "--delete-before"),
+                (self.rebuild_photos_db, "--rebuild-photos-db"),
+                (self.yes, "--yes"),
+            ] {
+                if set {
+                    bail!("{flag} needs --delete-verified or --delete-all");
+                }
+            }
             return Ok(None);
         }
         Ok(Some(prune::Options {
             before: self.delete_before.as_deref().map(prune::parse_date).transpose()?,
             yes: self.yes,
             rebuild_db: self.rebuild_photos_db,
+            all: self.delete_all,
         }))
     }
 }

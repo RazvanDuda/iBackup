@@ -8,6 +8,10 @@
 //!    (iPhone original and local copy) and must still equal the recorded hash.
 //! 4. A plan is shown and the user must type a confirmation (unless --yes).
 //! 5. Every deletion is logged to deleted.json. Any connection error stops; nothing is retried blindly.
+//!
+//! `--delete-all` relaxes 1 and 3 (the iPhone itself may be unable to hash its files) but never
+//! 2, 4 or 5: a group is only deleted when every one of its files is present on this computer with
+//! the same size and date, and the local copy still matches its recorded hash when we have one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -18,7 +22,7 @@ use idevice::afc::AfcClient;
 use idevice::IdeviceError;
 use serde::Serialize;
 
-use crate::afc_copy::{is_fatal, RemoteFile};
+use crate::afc_copy::{self, is_fatal, RemoteFile};
 use crate::util::{bytes_bar, human_bytes, local_path_for, Stats};
 use crate::verify::{self, Algo, Manifest};
 
@@ -29,6 +33,8 @@ pub struct Options {
     pub before: Option<i64>,
     pub yes: bool,
     pub rebuild_db: bool,
+    /// Delete every camera-roll item that has a copy on this computer, verified or not.
+    pub all: bool,
 }
 
 /// "DCIM/100APPLE/IMG_E0001.JPG" -> ("100APPLE", "IMG_0001")
@@ -63,14 +69,20 @@ struct Group {
     bytes: u64,
 }
 
-/// Groups where every member is verified and unchanged, and (optionally) older than `before`.
-fn plan(files: &[RemoteFile], m: &Manifest, before: Option<i64>) -> (Vec<Group>, usize) {
+/// Files grouped by the photo they belong to (Live Photo halves, edits, mutations).
+fn group_files(files: &[RemoteFile]) -> BTreeMap<(String, String), Vec<RemoteFile>> {
     let mut groups: BTreeMap<(String, String), Vec<RemoteFile>> = BTreeMap::new();
     for f in files {
         if let Some(k) = group_key(&f.path).or_else(|| mutation_key(&f.path)) {
             groups.entry(k).or_default().push(f.clone());
         }
     }
+    groups
+}
+
+/// Groups where every member is verified and unchanged, and (optionally) older than `before`.
+fn plan(files: &[RemoteFile], m: &Manifest, before: Option<i64>) -> (Vec<Group>, usize) {
+    let groups = group_files(files);
     let mut ok = Vec::new();
     let mut skipped = 0;
     for (_, members) in groups {
@@ -90,6 +102,54 @@ fn plan(files: &[RemoteFile], m: &Manifest, before: Option<i64>) -> (Vec<Group>,
         }
     }
     (ok, skipped)
+}
+
+/// `--delete-all` plan: every group that is present on this computer, verified or not.
+///
+/// Returns the groups to delete plus how many groups / files were kept because the copy here is
+/// missing, has a different size or date, or no longer matches the hash we recorded for it.
+fn plan_all(files: &[RemoteFile], out: &Path, before: Option<i64>) -> (Vec<Group>, usize, usize) {
+    let mut ok = Vec::new();
+    let mut kept_groups = 0;
+    let mut kept_files = 0;
+    for (_, members) in group_files(files) {
+        // Orphaned edits (mutations with no original) are deleted too: --delete-all empties the roll.
+        let newest = members.iter().map(|f| f.mtime).max().unwrap_or(0);
+        if before.is_some_and(|b| newest >= b) {
+            continue;
+        }
+        let not_here: Vec<&RemoteFile> = members
+            .iter()
+            .filter(|f| !afc_copy::unchanged(&local_path_for(out, &f.path), f))
+            .collect();
+        if !not_here.is_empty() {
+            kept_groups += 1;
+            kept_files += members.len();
+            continue;
+        }
+        let bytes = members.iter().map(|f| f.size).sum();
+        ok.push(Group { files: members, newest, bytes });
+    }
+    (ok, kept_groups, kept_files)
+}
+
+/// Proof for `--delete-all`, where the iPhone may be unable to hash its own files: the local copy
+/// must still have the size and date the phone reports, and (when verified.json has a record for
+/// it) still hash to exactly what we recorded. Returns the hash to log.
+fn local_proof(f: &RemoteFile, m: &Manifest, out: &Path) -> Option<String> {
+    let local = local_path_for(out, &f.path);
+    if !afc_copy::unchanged(&local, f) {
+        return None;
+    }
+    let (algo, recorded) = match m.get(&f.path) {
+        Some(v) => (v.algo, Some(v.hash.clone())),
+        None => (Algo::Sha256, None),
+    };
+    let got = hex::encode(verify::hash_local(&local, algo).ok()?);
+    match recorded {
+        Some(want) if want != got => None,
+        _ => Some(got),
+    }
 }
 
 /// Re-hash one file on both sides and compare with the recorded hash.
@@ -120,11 +180,25 @@ async fn recheck(afc: &mut AfcClient, f: &RemoteFile, m: &Manifest, out: &Path) 
     Ok(local_hash.is_some_and(|h| hex::encode(h) == v.hash))
 }
 
-fn confirm(n_files: usize, n_groups: usize, bytes: u64, oldest: i64, newest: i64, rebuild_db: bool) -> Result<bool> {
+fn confirm(
+    n_files: usize,
+    n_groups: usize,
+    bytes: u64,
+    oldest: i64,
+    newest: i64,
+    rebuild_db: bool,
+    all: bool,
+) -> Result<bool> {
     eprintln!();
     eprintln!("About to DELETE from the iPhone: {n_files} files ({n_groups} photos/videos, {})", human_bytes(bytes));
     eprintln!("  dated {} … {}", verify::fmt_time(oldest), verify::fmt_time(newest));
-    eprintln!("  Each one is re-checked against its verified copy on this computer right before deletion.");
+    if all {
+        eprintln!("  --delete-all: every camera-roll item that has a copy on this computer goes, verified or not.");
+        eprintln!("  Right before deletion each local copy is hashed again and must still be the file recorded here;");
+        eprintln!("  items without such a copy stay on the iPhone.");
+    } else {
+        eprintln!("  Each one is re-checked against its verified copy on this computer right before deletion.");
+    }
     eprintln!();
     eprintln!("  WARNING: this deletes the files directly, bypassing the Photos app database.");
     eprintln!("   • If iCloud Photos is ON, turn it OFF first (Settings > Photos). Deleting with it on");
@@ -138,7 +212,7 @@ fn confirm(n_files: usize, n_groups: usize, bytes: u64, oldest: i64, newest: i64
     }
     eprintln!("  There is no undo on the phone. Your copies stay on this computer.");
     eprintln!();
-    let expected = format!("delete {n_files}");
+    let expected = if all { format!("delete all {n_files}") } else { format!("delete {n_files}") };
     eprint!("Type \"{expected}\" to continue: ");
     std::io::stderr().flush().ok();
     let mut line = String::new();
@@ -178,10 +252,21 @@ pub async fn run(
     stats: &mut Stats,
 ) -> Result<()> {
     let manifest = verify::load_manifest(out);
-    let (groups, skipped) = plan(files, &manifest, opts.before);
-    if skipped > 0 {
-        stats.notes.push(format!("{skipped} photos/videos kept on the iPhone: not every part of them is verified"));
-    }
+    let groups = if opts.all {
+        let (groups, kept_groups, kept_files) = plan_all(files, out, opts.before);
+        if kept_groups > 0 {
+            stats.notes.push(format!(
+                "{kept_groups} photos/videos ({kept_files} files) kept on the iPhone: no matching copy on this computer"
+            ));
+        }
+        groups
+    } else {
+        let (groups, skipped) = plan(files, &manifest, opts.before);
+        if skipped > 0 {
+            stats.notes.push(format!("{skipped} photos/videos kept on the iPhone: not every part of them is verified"));
+        }
+        groups
+    };
     if groups.is_empty() {
         stats.notes.push("nothing to delete from the iPhone".into());
         return Ok(());
@@ -191,7 +276,7 @@ pub async fn run(
     let oldest = groups.iter().map(|g| g.newest).min().unwrap_or(0);
     let newest = groups.iter().map(|g| g.newest).max().unwrap_or(0);
 
-    if !opts.yes && !confirm(n_files, groups.len(), bytes, oldest, newest, opts.rebuild_db)? {
+    if !opts.yes && !confirm(n_files, groups.len(), bytes, oldest, newest, opts.rebuild_db, opts.all)? {
         bail!("cancelled; nothing was deleted");
     }
 
@@ -204,8 +289,26 @@ pub async fn run(
 
     'groups: for g in &groups {
         // Check every member before touching any of them.
+        let mut proofs: BTreeMap<String, String> = BTreeMap::new();
         for f in &g.files {
             bar.set_message(format!("checking {}", f.path));
+            if opts.all {
+                // The iPhone may be the broken half here (that is why --delete-all exists), so the
+                // proof comes from the copy on this computer instead of a hash from the phone.
+                match local_proof(f, &manifest, out) {
+                    Some(h) => {
+                        proofs.insert(f.path.clone(), h);
+                    }
+                    None => {
+                        stats
+                            .errors
+                            .push(format!("{}: no matching copy on this computer, kept on iPhone (with its group)", f.path));
+                        bar.inc(g.bytes);
+                        continue 'groups;
+                    }
+                }
+                continue;
+            }
             match recheck(&mut afc, f, &manifest, out).await {
                 Ok(true) => {}
                 Ok(false) => {
@@ -225,6 +328,11 @@ pub async fn run(
         ordered.sort_by_key(|f| (f.path.starts_with("DCIM/") && !f.path.to_ascii_uppercase().ends_with(".MOV"), f.path.clone()));
         for f in ordered {
             bar.set_message(format!("deleting {}", f.path));
+            let logged_hash = proofs
+                .get(&f.path)
+                .cloned()
+                .or_else(|| manifest.get(&f.path).map(|v| v.hash.clone()))
+                .unwrap_or_default();
             match afc.remove(f.path.clone()).await {
                 Ok(()) => {
                     deleted_files += 1;
@@ -232,7 +340,7 @@ pub async fn run(
                     log.push(DeletedEntry {
                         path: f.path.clone(),
                         size: f.size,
-                        hash: manifest.get(&f.path).map(|v| v.hash.clone()).unwrap_or_default(),
+                        hash: logged_hash,
                         deleted_at: chrono::Local::now().to_rfc3339(),
                     });
                 }
@@ -253,12 +361,17 @@ pub async fn run(
     append_log(out, &log)?;
 
     stats.notes.push(format!(
-        "deleted {deleted_files} verified files ({}) from the iPhone; log in {}",
+        "deleted {deleted_files} {}files ({}) from the iPhone; log in {}",
+        if opts.all { "" } else { "verified " },
         human_bytes(deleted_bytes),
         out.join(DELETED_LOG).display()
     ));
     if let Some(e) = failure {
-        bail!("connection lost during deletion ({e}). Everything deleted so far is logged; rerun to continue.");
+        bail!(
+            "the device stopped answering during deletion ({}). Everything deleted so far is logged; \
+             rerun to continue.",
+            afc_copy::explain(&e)
+        );
     }
 
     if opts.rebuild_db && deleted_files > 0 {
@@ -292,8 +405,11 @@ async fn rebuild_photos_db(afc: &mut AfcClient, out: &Path, stats: &mut Stats) -
     // Back up first; abort the rebuild if any backup fails.
     for t in &targets {
         let mut fd = afc.open(t.clone(), idevice::afc::opcode::AfcFopenMode::RdOnly).await?;
-        let data = fd.read_entire().await?;
-        fd.close().await?;
+        let read = fd.read_entire().await;
+        // Close before checking the result: a leaked handle exhausts the phone's AFC service.
+        let closed = fd.close().await;
+        let data = read?;
+        closed?;
         std::fs::write(backup_dir.join(t.trim_start_matches("PhotoData/")), data)
             .with_context(|| format!("backing up {t}"))?;
     }
@@ -322,6 +438,10 @@ mod tests {
 
     fn rf(p: &str, t: i64) -> RemoteFile {
         RemoteFile { path: p.into(), size: 10, mtime: t }
+    }
+    fn ver_hash(m: &mut Manifest, f: &RemoteFile, hash: String) {
+        ver(m, f);
+        m.get_mut(&f.path).unwrap().hash = hash;
     }
     fn ver(m: &mut Manifest, f: &RemoteFile) {
         m.insert(
@@ -359,6 +479,43 @@ mod tests {
         assert_eq!(skipped, 1);
         assert_eq!(ok.len(), 1);
         assert_eq!(ok[0].files[0].path, "DCIM/100APPLE/IMG_0002.HEIC");
+    }
+
+    /// --delete-all still refuses a group unless every one of its files is here, with the size and
+    /// date the phone reports: a missing Live Photo half keeps the whole photo on the iPhone.
+    #[test]
+    fn delete_all_needs_every_file_present_here() {
+        let dir = std::env::temp_dir().join("ibackup-plan-all-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let heic = rf("DCIM/100APPLE/IMG_0001.HEIC", 100);
+        let mov = rf("DCIM/100APPLE/IMG_0001.MOV", 100);
+        let solo = rf("DCIM/100APPLE/IMG_0002.HEIC", 100);
+        let orphan = rf("PhotoData/Mutations/DCIM/100APPLE/IMG_0009/Adjustments/FullSizeRender.jpg", 100);
+
+        for f in [&heic, &solo, &orphan] {
+            let local = local_path_for(&dir, &f.path);
+            std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+            std::fs::write(&local, vec![0u8; f.size as usize]).unwrap();
+            filetime::set_file_mtime(&local, filetime::FileTime::from_unix_time(f.mtime, 0)).unwrap();
+        }
+        // IMG_0001.MOV is missing locally, so the pair stays; the solo photo and the orphaned
+        // edit (no original left on the phone) go.
+        let (ok, kept_groups, kept_files) = plan_all(&[heic.clone(), mov.clone(), solo.clone(), orphan.clone()], &dir, None);
+        let mut paths: Vec<&str> = ok.iter().flat_map(|g| g.files.iter().map(|f| f.path.as_str())).collect();
+        paths.sort();
+        assert_eq!(paths, vec![solo.path.as_str(), orphan.path.as_str()]);
+        assert_eq!((kept_groups, kept_files), (1, 2));
+        assert!(plan_all(&[solo.clone()], &dir, Some(100)).0.is_empty());
+
+        // Same size, different bytes than the recorded hash: kept.
+        let mut m = Manifest::new();
+        ver(&mut m, &solo);
+        assert!(local_proof(&solo, &m, &dir).is_none());
+        // A record whose hash matches the local file: proof, and the hash is what gets logged.
+        let real = hex::encode(verify::hash_local(&local_path_for(&dir, &solo.path), Algo::Sha1).unwrap());
+        ver_hash(&mut m, &solo, real.clone());
+        assert_eq!(local_proof(&solo, &m, &dir), Some(real));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

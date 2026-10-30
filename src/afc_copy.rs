@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use idevice::afc::errors::AfcError;
+use idevice::afc::file::FileDescriptor;
 use idevice::afc::{opcode::AfcFopenMode, AfcClient};
 use idevice::IdeviceError;
 use indicatif::ProgressBar;
@@ -38,7 +40,35 @@ pub fn is_fatal(e: &IdeviceError) -> bool {
             | IdeviceError::Timeout
             | IdeviceError::NoEstablishedConnection
             | IdeviceError::SessionInactive
+    ) || is_device_trouble(e)
+}
+
+/// Errors that mean "the phone refuses to serve files right now", not "this one file is bad".
+///
+/// AFC error 3 (`NoResources`) is the phone's file service having run out of file handles or
+/// memory. It is not about the file we asked for: every request after it fails the same way, so
+/// treating it as a per-file error produces thousands of identical error lines and a run that
+/// looks like it half-worked. We reconnect and retry instead, and stop with advice if it stays.
+pub fn is_device_trouble(e: &IdeviceError) -> bool {
+    matches!(
+        e,
+        IdeviceError::Afc(
+            AfcError::NoResources | AfcError::NoMem | AfcError::ServiceNotConnected | AfcError::MuxError
+        )
     )
+}
+
+pub const TROUBLE_HINT: &str = "The iPhone's file service is out of resources, so it stopped serving files.\n  \
+     Your photos and your copies on this computer are not affected. Unlock the iPhone, unplug and \
+     replug the cable, and restart the iPhone if it keeps happening, then run the command again.";
+
+/// The error, plus what to do about it when the phone is the one that ran out of resources.
+pub fn explain(e: &IdeviceError) -> String {
+    if is_device_trouble(e) {
+        format!("{e}\n  {TROUBLE_HINT}")
+    } else {
+        format!("{e}")
+    }
 }
 
 /// Recursively list regular files under `root`. Skips directories matching `exclude`.
@@ -54,6 +84,8 @@ pub async fn scan(
         let names = match afc.list_dir(dir.clone()).await {
             Ok(n) => n,
             Err(e) if is_fatal(&e) => return Err(e),
+            // Never let a root we could not read look like "0 files on the device".
+            Err(e) if dir == root => return Err(e),
             Err(e) => {
                 stats.errors.push(format!("list {dir}: {e}"));
                 continue;
@@ -91,7 +123,7 @@ pub async fn scan(
 }
 
 /// Unchanged if a local file exists with the same size and (to the second) the same mtime.
-fn unchanged(local: &Path, f: &RemoteFile) -> bool {
+pub fn unchanged(local: &Path, f: &RemoteFile) -> bool {
     let Ok(m) = std::fs::metadata(local) else { return false };
     if m.len() != f.size {
         return false;
@@ -112,9 +144,23 @@ async fn copy_one(afc: &mut AfcClient, f: &RemoteFile, dest: &Path, bar: &Progre
         s.into()
     };
     let mut fd = afc.open(f.path.clone(), AfcFopenMode::RdOnly).await.map_err(CopyErr::Device)?;
-    let mut out = tokio::fs::File::create(&tmp).await.map_err(CopyErr::Local)?;
+    let copied = stream_to_local(&mut fd, &tmp, bar).await;
+    // Always release the handle on the phone, even after a failed read. A leaked handle is one
+    // the phone's AFC service can never reuse, and once it runs out every request fails with
+    // "No resources available" (AFC error 3).
+    let closed = fd.close().await;
+    copied?;
+    closed.map_err(CopyErr::Device)?;
 
-    // Stream in chunks so huge videos never sit in memory.
+    tokio::fs::rename(&tmp, dest).await.map_err(CopyErr::Local)?;
+    let t = filetime::FileTime::from_unix_time(f.mtime, 0);
+    let _ = filetime::set_file_mtime(dest, t);
+    Ok(())
+}
+
+/// Stream an open device file into `tmp` in chunks, so huge videos never sit in memory.
+async fn stream_to_local(fd: &mut FileDescriptor<'_>, tmp: &Path, bar: &ProgressBar) -> Result<(), CopyErr> {
+    let mut out = tokio::fs::File::create(tmp).await.map_err(CopyErr::Local)?;
     const CHUNK: usize = 4 * 1024 * 1024;
     loop {
         let buf = fd.read_n(CHUNK).await.map_err(CopyErr::Device)?;
@@ -127,11 +173,6 @@ async fn copy_one(afc: &mut AfcClient, f: &RemoteFile, dest: &Path, bar: &Progre
     }
     out.flush().await.map_err(CopyErr::Local)?;
     drop(out);
-    fd.close().await.map_err(CopyErr::Device)?;
-
-    tokio::fs::rename(&tmp, dest).await.map_err(CopyErr::Local)?;
-    let t = filetime::FileTime::from_unix_time(f.mtime, 0);
-    let _ = filetime::set_file_mtime(dest, t);
     Ok(())
 }
 
@@ -194,4 +235,24 @@ pub async fn retry_pause() {
 
 pub fn ensure_dir(p: &Path) -> Result<()> {
     std::fs::create_dir_all(p).with_context(|| format!("creating {}", p.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// "No resources available" is the phone's AFC service being exhausted, not a bad file:
+    /// it must stop the pass (reconnect + retry) instead of being logged 1690 times.
+    #[test]
+    fn out_of_resources_on_the_phone_counts_as_fatal() {
+        let e = IdeviceError::Afc(AfcError::NoResources);
+        assert!(is_device_trouble(&e));
+        assert!(is_fatal(&e));
+        assert!(explain(&e).contains("restart the iPhone"));
+
+        assert!(!is_device_trouble(&IdeviceError::Afc(AfcError::ObjectNotFound)));
+        assert!(!is_fatal(&IdeviceError::Afc(AfcError::ObjectNotFound)));
+        assert_eq!(explain(&IdeviceError::Afc(AfcError::ObjectNotFound)), "afc error: Object not found");
+        assert!(!is_fatal(&IdeviceError::Afc(AfcError::PermDenied)));
+    }
 }
